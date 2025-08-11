@@ -1,10 +1,47 @@
 'use client';
 
 import { useParams, useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { setupWorkspaceSchema } from '@/lib/supabase/setup';
 import { useWorkspaceActivity } from '@/hooks/useWorkspaceActivity';
 import { UserActivityIndicator, UserProfileCard } from '@/components/UserActivityIndicator';
+import { FileUploadDialog } from '@/components/file-upload-dialog';
+import { FinanceSummaryCards } from '@/components/finance-summary-cards';
+import { TransactionsTable } from '@/components/transactions-table';
+import { createClient } from '@/lib/supabase/client';
+import { getUserColor } from '@/lib/transaction-categorizer';
+
+interface Transaction {
+  id: string;
+  date: string;
+  description: string;
+  amount: number;
+  category: string;
+  type: 'income' | 'expense';
+  uploaded_by: string;
+  user_color?: string;
+  created_at: string;
+}
+
+interface FinanceSummaryData {
+  totalBalance: number;
+  monthlyIncome: {
+    amount: number;
+    count: number;
+  };
+  monthlyExpenses: {
+    amount: number;
+    count: number;
+  };
+  contributors: {
+    [userSession: string]: {
+      name: string;
+      color: string;
+      income: number;
+      expenses: number;
+    };
+  };
+}
 
 export default function WorkspacePage() {
   const params = useParams();
@@ -13,6 +50,9 @@ export default function WorkspacePage() {
   
   const [schemaReady, setSchemaReady] = useState(false);
   const [dbError, setDbError] = useState<string | null>(null);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [financeData, setFinanceData] = useState<FinanceSummaryData | null>(null);
+  const [loading, setLoading] = useState(true);
   
   // Use the consolidated activity hook
   const {
@@ -24,6 +64,97 @@ export default function WorkspacePage() {
     exitWorkspace,
   } = useWorkspaceActivity(workspaceId, schemaReady);
 
+  // Fetch transactions and calculate finance data
+  const fetchFinanceData = useCallback(async () => {
+    if (!schemaReady) return;
+    
+    try {
+      const supabase = createClient();
+      
+      // Fetch all transactions for this workspace
+      const { data: transactionItems, error } = await supabase
+        .from('workspace_items')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .eq('item_type', 'transaction')
+        .order('created_at', { ascending: false });
+      
+      if (error) throw error;
+      
+      // Transform data for display
+      const processedTransactions = transactionItems?.map(item => ({
+        id: item.id,
+        date: item.transaction_data.date,
+        description: item.transaction_data.description,
+        amount: item.transaction_data.amount,
+        category: item.transaction_data.category,
+        type: item.transaction_data.type,
+        uploaded_by: item.uploaded_by,
+        user_color: item.transaction_data.user_color,
+        created_at: item.created_at
+      })) || [];
+      
+      setTransactions(processedTransactions);
+      
+      // Calculate summary data
+      const contributors: { [key: string]: { name: string; color: string; income: number; expenses: number } } = {};
+      let totalIncome = 0;
+      let totalExpenses = 0;
+      let incomeCount = 0;
+      let expenseCount = 0;
+      
+      // Build contributors map from online users and transaction uploaders
+      [...onlineUsers, { user_session: session, user_name: userName }].forEach(user => {
+        if (user.user_session && !contributors[user.user_session]) {
+          contributors[user.user_session] = {
+            name: user.user_name || 'Anonymous',
+            color: getUserColor(user.user_session),
+            income: 0,
+            expenses: 0
+          };
+        }
+      });
+      
+      // Process transactions for summary
+      processedTransactions.forEach(transaction => {
+        const amount = transaction.amount;
+        const contributor = contributors[transaction.uploaded_by];
+        
+        if (transaction.type === 'income') {
+          totalIncome += amount;
+          incomeCount++;
+          if (contributor) contributor.income += amount;
+        } else {
+          totalExpenses += amount;
+          expenseCount++;
+          if (contributor) contributor.expenses += amount;
+        }
+        
+        // Ensure contributor exists
+        if (!contributor && transaction.uploaded_by) {
+          contributors[transaction.uploaded_by] = {
+            name: 'Unknown User',
+            color: getUserColor(transaction.uploaded_by),
+            income: transaction.type === 'income' ? amount : 0,
+            expenses: transaction.type === 'expense' ? amount : 0
+          };
+        }
+      });
+      
+      setFinanceData({
+        totalBalance: totalIncome - totalExpenses,
+        monthlyIncome: { amount: totalIncome, count: incomeCount },
+        monthlyExpenses: { amount: totalExpenses, count: expenseCount },
+        contributors
+      });
+      
+    } catch (error) {
+      console.error('Error fetching finance data:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [schemaReady, workspaceId, onlineUsers, session, userName]);
+
   useEffect(() => {
     // Check if database schema is set up
     setupWorkspaceSchema().then((result) => {
@@ -34,6 +165,38 @@ export default function WorkspacePage() {
       }
     });
   }, []);
+
+  useEffect(() => {
+    if (schemaReady) {
+      fetchFinanceData();
+    }
+  }, [schemaReady, onlineUsers]);
+
+  // Set up real-time subscription for transaction updates
+  useEffect(() => {
+    if (!schemaReady) return;
+    
+    const supabase = createClient();
+    const channel = supabase
+      .channel(`workspace-transactions-${workspaceId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'workspace_items',
+          filter: `workspace_id=eq.${workspaceId}`,
+        },
+        () => {
+          fetchFinanceData(); // Refresh data when transactions change
+        }
+      )
+      .subscribe();
+    
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [schemaReady, workspaceId]);
 
   const copyWorkspaceUrl = () => {
     navigator.clipboard.writeText(window.location.href);
@@ -88,7 +251,7 @@ export default function WorkspacePage() {
 
   return (
     <div className="min-h-screen bg-background p-6">
-      <div className="max-w-4xl mx-auto space-y-6">
+      <div className="max-w-7xl mx-auto space-y-6">
         {/* Header with Activity Indicator */}
         <UserActivityIndicator
           currentSession={session}
@@ -98,73 +261,66 @@ export default function WorkspacePage() {
           onExitWorkspace={handleExitWorkspace}
         />
 
-        {/* Workspace ID Display */}
-        <div className="text-muted-foreground text-sm">
-          Workspace ID: {workspaceId}
-        </div>
-
-        {/* Main Workspace Content */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {/* User Profile Card */}
-          <UserProfileCard
-            session={session}
-            userName={userName}
-            isOnline={isOnline}
-            onUpdateUserName={updateUserName}
-          />
-
-          {/* Workspace Info */}
-          <div className="rounded-lg border p-6">
-            <h3 className="font-semibold mb-2">Workspace Info</h3>
-            <div className="space-y-2 text-sm">
-              <p><span className="text-muted-foreground">ID:</span> {workspaceId}</p>
-              <p><span className="text-muted-foreground">Created:</span> Just now</p>
-              <p><span className="text-muted-foreground">Type:</span> Collaborative</p>
-            </div>
+        {/* Workspace Info */}
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold">💰 Finance Workspace</h1>
+            <p className="text-sm text-muted-foreground">
+              Collaborative financial tracking • {workspaceId}
+            </p>
           </div>
-
-          {/* Quick Actions */}
-          <div className="rounded-lg border p-6">
-            <h3 className="font-semibold mb-2">Quick Actions</h3>
-            <div className="space-y-2">
-              <button className="w-full text-left px-3 py-2 rounded text-sm hover:bg-muted">
-                📝 Create Note
-              </button>
-              <button className="w-full text-left px-3 py-2 rounded text-sm hover:bg-muted">
-                🎨 Start Drawing
-              </button>
-              <button className="w-full text-left px-3 py-2 rounded text-sm hover:bg-muted">
-                💬 Add Comment
-              </button>
-            </div>
+          
+          <div className="flex items-center gap-4">
+            <UserProfileCard
+              session={session}
+              userName={userName}
+              isOnline={isOnline}
+              onUpdateUserName={updateUserName}
+            />
           </div>
         </div>
 
-        {/* Collaborative Demo Area */}
-        <div className="rounded-lg border p-6">
-          <h3 className="font-semibold mb-4">Shared Canvas</h3>
-          <div className="min-h-64 bg-muted/20 rounded border-2 border-dashed border-muted-foreground/25 flex items-center justify-center">
-            <div className="text-center">
-              <p className="text-muted-foreground mb-2">
-                This is your shared workspace canvas
-              </p>
-              <p className="text-sm text-muted-foreground">
-                Anyone with this URL can collaborate here in real-time
-              </p>
-            </div>
+        {loading ? (
+          <div className="flex items-center justify-center py-12">
+            <div className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full"></div>
           </div>
-        </div>
+        ) : (
+          <>
+            {/* Finance Summary Cards */}
+            {financeData && (
+              <FinanceSummaryCards data={financeData} />
+            )}
 
-        {/* Instructions */}
-        <div className="rounded-lg bg-muted/50 p-6">
-          <h3 className="font-semibold mb-2">How it works</h3>
-          <ul className="text-sm text-muted-foreground space-y-1">
-            <li>• This workspace is identified by its URL - no sign-up required</li>
-            <li>• Share the URL with others to invite them to collaborate</li>
-            <li>• Everyone sees real-time updates and can see who else is online</li>
-            <li>• Each person gets a temporary session ID for this browser session</li>
-          </ul>
-        </div>
+            {/* File Upload Section */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-2">
+                <TransactionsTable 
+                  transactions={transactions}
+                  contributors={financeData?.contributors || {}}
+                />
+              </div>
+              
+              <div className="space-y-4">
+                <FileUploadDialog
+                  workspaceId={workspaceId}
+                  userSession={session}
+                  onTransactionsUploaded={fetchFinanceData}
+                />
+                
+                {/* Instructions */}
+                <div className="rounded-lg border p-4">
+                  <h3 className="font-semibold mb-2 text-sm">💡 How it works</h3>
+                  <ul className="text-xs text-muted-foreground space-y-1">
+                    <li>• Share this URL with your partner or family</li>
+                    <li>• Everyone can upload their bank statements</li>
+                    <li>• Transactions are automatically categorized</li>
+                    <li>• See combined financial insights in real-time</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
